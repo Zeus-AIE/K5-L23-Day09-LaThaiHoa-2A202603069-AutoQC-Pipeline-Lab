@@ -34,6 +34,162 @@ import yaml  # noqa: F401
 from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
+REMOVE_CODES = {
+    "DUP_IMAGE_EXACT",
+    "DUP_IMAGE_NEAR",
+    "LEAK_TEST",
+    "CORRUPT_IMAGE",
+    "BAD_SIZE",
+}
+DROP_LINE_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+
+
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    err_issues = [i for i in issues if i.severity == ERROR]
+    fixes = []
+    removed_images = set()
+
+    # 1. Xoá ảnh (và file nhãn đi kèm) cho lỗi cửa vào
+    for i in err_issues:
+        if i.code not in REMOVE_CODES or i.image in removed_images:
+            continue
+        img_p = ds.image_path(i.image)
+        lbl_p = ds.label_path(i.image)
+        if (img_p is not None and img_p.exists()) or lbl_p.exists():
+            if img_p is not None and img_p.exists():
+                img_p.unlink()
+            if lbl_p.exists():
+                lbl_p.unlink()
+            removed_images.add(i.image)
+            ds._size_cache.pop(i.image, None)
+            fixes.append(
+                {
+                    "image": i.image,
+                    "line": "",
+                    "action": "remove_image",
+                    "before": i.code,
+                    "after": "đã xoá ảnh và nhãn",
+                }
+            )
+
+    # 2. Sửa danh sách tên lớp trong data.yaml
+    if any(i.code == "BAD_CLASS_NAME" for i in err_issues):
+        target_names = list(cfg["classes"])
+        cur_map = ds.yaml_names()
+        cur_list = [cur_map.get(idx) for idx in range(len(target_names))]
+        if len(cur_map) != len(target_names) or cur_list != target_names:
+            if ds.yaml_path.exists():
+                data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+            else:
+                data = {"path": "."}
+            before_names = str(data.get("names", {}))
+            data["names"] = {idx: name for idx, name in enumerate(target_names)}
+            ds.yaml_path.write_text(
+                yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
+            fixes.append(
+                {
+                    "image": "data.yaml",
+                    "line": "",
+                    "action": "rename_classes",
+                    "before": before_names,
+                    "after": str(data["names"]),
+                }
+            )
+
+    # 3. Đánh dấu ảnh thiếu file nhãn để đẩy sang hàng đợi người gán (không tạo file rỗng)
+    missing_seen = set()
+    for i in err_issues:
+        if i.code != "MISSING_LABEL_FILE" or i.image in removed_images or i.image in missing_seen:
+            continue
+        if not ds.label_path(i.image).exists():
+            missing_seen.add(i.image)
+            fixes.append(
+                {
+                    "image": i.image,
+                    "line": "",
+                    "action": "needs_label",
+                    "before": "(không có file)",
+                    "after": "chuyển người gán",
+                }
+            )
+
+    # 4. Gom các lỗi theo dòng để sửa từng file một lần theo số dòng gốc
+    drop_by_img = defaultdict(set)
+    clip_by_img = defaultdict(set)
+    for i in err_issues:
+        if i.image in removed_images or i.line is None:
+            continue
+        if i.code in DROP_LINE_CODES:
+            drop_by_img[i.image].add(i.line)
+        elif i.code == "BOX_OUT_OF_IMAGE":
+            clip_by_img[i.image].add(i.line)
+
+    for stem in sorted(set(drop_by_img) | set(clip_by_img)):
+        lp = ds.label_path(stem)
+        if not lp.exists():
+            continue
+        raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+        drops = drop_by_img[stem]
+        clips = clip_by_img[stem] - drops  # drop_line luôn thắng nếu một dòng dính cả 2 lỗi
+        new_lines = []
+        for idx, raw_ln in enumerate(raw_lines, 1):
+            if idx in drops:
+                fixes.append(
+                    {
+                        "image": stem,
+                        "line": idx,
+                        "action": "drop_line",
+                        "before": raw_ln,
+                        "after": "",
+                    }
+                )
+                continue
+            if idx in clips:
+                try:
+                    cls_id, cx, cy, w, h = parse_yolo_line(raw_ln)
+                except ValueError:
+                    fixes.append(
+                        {
+                            "image": stem,
+                            "line": idx,
+                            "action": "drop_line",
+                            "before": raw_ln,
+                            "after": "",
+                        }
+                    )
+                    continue
+                x1 = max(0.0, cx - w / 2)
+                y1 = max(0.0, cy - h / 2)
+                x2 = min(1.0, cx + w / 2)
+                y2 = min(1.0, cy + h / 2)
+                nw, nh = x2 - x1, y2 - y1
+                if nw <= 1e-9 or nh <= 1e-9:
+                    fixes.append(
+                        {
+                            "image": stem,
+                            "line": idx,
+                            "action": "drop_line",
+                            "before": raw_ln,
+                            "after": "",
+                        }
+                    )
+                    continue
+                ncx, ncy = (x1 + x2) / 2, (y1 + y2) / 2
+                fixed_ln = f"{cls_id} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
+                new_lines.append(fixed_ln)
+                fixes.append(
+                    {
+                        "image": stem,
+                        "line": idx,
+                        "action": "clip_box",
+                        "before": raw_ln,
+                        "after": fixed_ln,
+                    }
+                )
+            else:
+                new_lines.append(raw_ln)
+        lp.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+
+    return fixes
